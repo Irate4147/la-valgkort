@@ -38,7 +38,7 @@ KORT = {  # valgtal.dk/data/kort/<navn>.topojson?v=<version>
 
 
 def hent(url, valg_id=None, forsøg=4):
-    headers = {"Accept": "application/json" if valg_id else "*/*", "User-Agent": "la-valgkort/1.0 (github.com/Irate4147/valgkort-nordsjaelland)"}
+    headers = {"Accept": "application/json" if valg_id else "*/*", "User-Agent": "la-valgkort/1.0 (github.com/Irate4147/la-valgkort)"}
     if valg_id:
         headers["X-Election-ID"] = valg_id
     for i in range(forsøg):

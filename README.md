@@ -2,7 +2,7 @@
 
 Interaktivt kort over Liberal Alliances stemmer ved folketingsvalgene 2026 (FV26) og 2022 (FV22) i hele landet – alle 10 storkredse, 98 kommuner og ca. 1.300 afstemningsområder. Samme designsprog som [lau-kort](https://github.com/Irate4147/lau-kort) (MapLibre + OpenFreeMap, sidepanel til venstre).
 
-**Side:** https://irate4147.github.io/valgkort-nordsjaelland/
+**Side:** https://irate4147.github.io/la-valgkort/
 
 **Navigation:** Danmark → storkreds → kommune → afstemningsområde. Klik på kortet (eller i listerne) for at gå et niveau ned, eller vælg storkreds i menuen øverst. Opstillingskredsene kan også åbnes fra storkredsens side. Esc, et klik uden for kortet eller brødkrummerne går op igen. Tilstanden står i adressen (`#valg=fv26&sk=Nordsjællands Storkreds&kommune=Hillerød`), så en visning kan deles som link.
 
