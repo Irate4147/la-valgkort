@@ -1,4 +1,5 @@
-"""Henter rådata for Nordsjællands Storkreds fra valg.dk (FV26 og FV22) og
+"""Henter rådata for alle storkredse fra valg.dk (FV26 og FV22, ca. 2.900 kald – hentede filer
+springes over ved næste kørsel) og
 valgtal.dk's forenklede DAGI-kort (afstemningsområder + kommuner).
 
 Kør:  python3 -I scripts/hent.py      (skriver til data/raw/)
@@ -11,6 +12,7 @@ lukket, så vi bruger HTTP.
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 from pathlib import Path
 
@@ -21,7 +23,6 @@ VALG = {
     "fv26": "47b883ef-d0d3-4cb6-9da5-91963f0e9ba0",  # 24. marts 2026
     "fv22": "987875fe-0dae-42ac-be5b-62cf0bd5d65e",  # 1. november 2022
 }
-STORKREDS = "Nordsjælland"
 
 # Danmarks Statistiks certificerede kandidatstatistik (kandstat)
 DST = {
@@ -37,7 +38,7 @@ KORT = {  # valgtal.dk/data/kort/<navn>.topojson?v=<version>
 
 
 def hent(url, valg_id=None, forsøg=4):
-    headers = {"Accept": "application/json" if valg_id else "*/*", "User-Agent": "nordsjaelland-valgkort/1.0"}
+    headers = {"Accept": "application/json" if valg_id else "*/*", "User-Agent": "la-valgkort/1.0 (github.com/Irate4147/valgkort-nordsjaelland)"}
     if valg_id:
         headers["X-Election-ID"] = valg_id
     for i in range(forsøg):
@@ -55,22 +56,29 @@ def hent_valg(navn, valg_id):
     ud = RAW / navn
     ud.mkdir(parents=True, exist_ok=True)
     menu = json.loads(hent("https://valg.dk/api/overview/side-menu", valg_id))
-    sk = next(s for s in menu if STORKREDS in s["title"])
-    (ud / "menu.json").write_text(json.dumps(sk, ensure_ascii=False, indent=1))
-    for kreds in sk["children"]:
-        print(f"{navn}: {kreds['title']} ({len(kreds['children'])} områder)")
-        data = hent(f"https://valg.dk/api/detail/{kreds['id']}/ge-nomination-district-detail", valg_id)
-        (ud / f"kreds_{kreds['id']}.json").write_bytes(data)
-        for omr in kreds["children"]:
-            f = ud / f"omr_{omr['id']}.json"
-            if f.exists():
-                continue
-            f.write_bytes(hent(f"https://valg.dk/api/detail/{omr['id']}/ge-election-area-details", valg_id))
-            time.sleep(0.15)
+    (ud / "menu.json").write_text(json.dumps(menu, ensure_ascii=False, indent=1))
+    opgaver = []
+    for sk in menu:
+        for kreds in sk["children"]:
+            opgaver.append((ud / f"kreds_{kreds['id']}.json",
+                            f"https://valg.dk/api/detail/{kreds['id']}/ge-nomination-district-detail"))
+            for omr in kreds["children"]:
+                opgaver.append((ud / f"omr_{omr['id']}.json",
+                                f"https://valg.dk/api/detail/{omr['id']}/ge-election-area-details"))
+    mangler = [(f, u) for f, u in opgaver if not f.exists()]
+    print(f"{navn}: {len(menu)} storkredse, {len(opgaver)} filer, {len(mangler)} skal hentes")
 
-    # Kommune → afstemningsområder (valg.dk's egen inddeling), kun kommuner med
-    # områder i storkredsen.
-    omr_ids = {o["id"] for k in sk["children"] for o in k["children"]}
+    def én(fu):
+        f, u = fu
+        f.write_bytes(hent(u, valg_id))
+        time.sleep(0.1)
+    with ThreadPoolExecutor(4) as pool:  # høfligt: højst 4 samtidige kald
+        for i, _ in enumerate(pool.map(én, mangler), 1):
+            if i % 200 == 0:
+                print(f"  {navn}: {i}/{len(mangler)}")
+
+    # Kommune → afstemningsområder (valg.dk's egen inddeling). Findes kun for nyere valg.
+    omr_ids = {o["id"] for sk in menu for k in sk["children"] for o in k["children"]}
     kommuner = []
     for region in json.loads(hent(f"https://valg.dk/api/export-data/{valg_id}/get-region-list", valg_id)):
         for kom in json.loads(hent(f"https://valg.dk/api/overview/region/{region['id']}/side-menu", valg_id)):

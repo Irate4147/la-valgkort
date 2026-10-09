@@ -3,8 +3,8 @@
 Kør:  python3 -I scripts/byg.py
 
 Skriver
-  data/valg.json        – resultater pr. afstemningsområde (FV26 og FV22)
-  data/kort_fv26.json   – TopoJSON med storkredsens afstemningsområder ved FV26
+  data/valg.json        – resultater pr. afstemningsområde i hele landet (FV26 og FV22)
+  data/kort_fv26.json   – TopoJSON med alle afstemningsområder ved FV26
   data/kort_fv22.json   – det samme for FV22
 
 Kontroller (scriptet stopper ved fejl):
@@ -12,6 +12,7 @@ Kontroller (scriptet stopper ved fejl):
   * summen af områderne = valg.dk's opstillingskredstal for alle partier og
     alle LA-kandidater
   * hvert område har en kommune
+  * LA-kandidaternes personlige stemmer = DST's kandstat i hver storkreds
 """
 import html
 import json
@@ -42,10 +43,15 @@ def norm(s):
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
+# DAGI og valg.dk er uenige om enkelte navne (DAGI bruger 6. kreds' gamle navn).
+KREDS_ALIAS = {"utterslev": "bispebjerg", "esbjerg omegns": "esbjerg omegn"}
+
+
 def kredsnavn(s):
-    """'1. Helsingør' / 'Helsingørkredsen' -> 'helsingør'."""
-    s = re.sub(r"^\d+\.\s*", "", s.strip())
-    return re.sub(r"kredsen$", "", s.lower())
+    """'1. Helsingør' / 'Helsingørkredsen' -> 'helsingør' (Århus skrives Aarhus)."""
+    s = re.sub(r"^\d+\.\s*", "", s.strip()).lower().replace("århus", "aarhus")
+    s = re.sub(r"\s+", " ", re.sub(r"kredsen$", "", s)).strip()
+    return KREDS_ALIAS.get(s, s)
 
 
 # ---------- TopoJSON ----------
@@ -140,12 +146,17 @@ def _alle_buer(g):
 
 # ---------- Danmarks Statistik (kandstat) ----------
 
-def dst_kandidater(kode):
+def dst_kandidater(kode, storkreds):
     """LA's kandidater i storkredsen fra DST's kandstat: prioriteret i kreds nr.,
     personlige stemmer, valgt nr./stedfortræder nr."""
     t = (RAW / kode / "dst_kandstat.htm").read_text(encoding="utf-8")
-    s = t.find("I. Liberal Alliance - Nordsjællands Storkreds")
+    s = t.find(f"I. Liberal Alliance - {storkreds}<")
+    if s < 0:
+        fejl(f"{kode}: LA i {storkreds} ikke fundet hos DST")
+        return {}
     slut = t.find('class="partier1"', s + 10)
+    if slut < 0:
+        slut = t.find("</table>", s)
     ud = {}
     for række in re.findall(r'<tr><td class="personer">(.*?)</tr>', t[s:slut]):
         celler = [html.unescape(re.sub(r"<[^>]+>", "", c)).strip() for c in re.split(r"</td>", række)]
@@ -203,6 +214,21 @@ def læs_område(f):
     }
 
 
+def læg_sammen(rs):
+    ud = {**rs[0], "navn": rs[0]["navn"], "stemmested": " / ".join(r["stemmested"] or "" for r in rs),
+          "adresse": " / ".join(r["adresse"] or "" for r in rs), "partier": defaultdict(int), "kandidater": defaultdict(int)}
+    for k in ("stemmeberettigede", "afgivne", "gyldige", "blanke", "la_partistemmer"):
+        ud[k] = sum(r[k] for r in rs)
+    for r in rs:
+        for b, n in r["partier"].items():
+            ud["partier"][b] += n
+        for bn, n in r["kandidater"].items():
+            ud["kandidater"][bn] += n
+    ud["partier"], ud["kandidater"] = dict(ud["partier"]), dict(ud["kandidater"])
+    ud["sammenlagt"] = len(rs)
+    return ud
+
+
 def partinavne(raw):
     navne = {}
     for f in sorted(raw.glob("kreds_*.json")):
@@ -213,22 +239,29 @@ def partinavne(raw):
     return navne
 
 
-def byg_valg(kode, cfg, kommune_af_dagi, kommune_polys):
+def byg_valg(kode, cfg, kommune_af_dagi, kommune_polys, område26_polys):
     raw = RAW / kode
     menu = json.loads((raw / "menu.json").read_text())
     topo = json.loads((RAW / "geo" / f"{cfg['kort']}.topojson").read_text())
-    obj = topo["objects"][cfg["kort"]]
-    geoms = [g for g in obj["geometries"] if "Nordsj" in g["properties"]["storkredsnavn"]]
+    geoms = topo["objects"][cfg["kort"]]["geometries"]
     buer = ringe_abs(topo)
 
     # kortområder pr. (kreds, navn)
-    kort_idx = {}
+    kort_idx = defaultdict(list)
     for g in geoms:
         p = g["properties"]
-        nøgle = (kredsnavn(p["opstillingskredsnavn"]), norm(p["navn"]))
-        if nøgle in kort_idx:
-            fejl(f"{kode}: dobbelt kortområde {nøgle}")
-        kort_idx[nøgle] = g
+        kort_idx[(kredsnavn(p["opstillingskredsnavn"]), norm(p["navn"]))].append(g)
+    # Områder med samme (afkortede) navn i samme kreds kan ikke skelnes hverken hos valg.dk
+    # eller i kortet – de lægges sammen til ét område (geometrierne som én MultiPolygon).
+    for nøgle, gs in list(kort_idx.items()):
+        if len(gs) > 1:
+            gs.sort(key=lambda g: g["properties"]["dagi_id"] is None)
+            arcs = [a for g in gs for a in (g["arcs"] if g["type"] == "MultiPolygon" else [g["arcs"]])]
+            samlet = {**gs[0], "type": "MultiPolygon", "arcs": arcs, "sammenlagt": len(gs)}
+            print(f"  {kode}: {len(gs)} kortområder med navnet '{gs[0]['properties']['navn']}' lægges sammen")
+            geoms = [g for g in geoms if g not in gs] + [samlet]
+            kort_idx[nøgle] = [samlet]
+    kort_idx = {k: v[0] for k, v in kort_idx.items()}
 
     # kommune pr. valg.dk-område-id (kun FV26 har valg.dk's kommunemenu)
     kom_af_id = {}
@@ -236,104 +269,139 @@ def byg_valg(kode, cfg, kommune_af_dagi, kommune_polys):
     if kf.exists():
         for k in json.loads(kf.read_text()):
             for oid in k["omraader"]:
-                kom_af_id[oid] = k["navn"].replace(" Kommune", "")
+                kom_af_id[oid] = kommunenavn(k["navn"])
 
     områder, brugte = [], set()
-    kredstal = {}
-    la_kand_orden = []
     alle_idx = {}  # (partibogstav, navn) -> indeks i "kandidater"
-    for kreds in menu["children"]:
-        kn = kredsnavn(kreds["title"])
-        kd = json.loads((raw / f"kreds_{kreds['id']}.json").read_text())
-        kredstal[kn] = kd
-        summer = defaultdict(int)
-        for o in kreds["children"]:
-            r = læs_område(raw / f"omr_{o['id']}.json")
-            g = kort_idx.get((kn, norm(r["navn"])))
-            if g is None:
-                fejl(f"{kode}: intet kortområde for {kreds['title']} / {r['navn']}")
-                continue
-            brugte.add(id(g))
-            p = g["properties"]
-            kom = kom_af_id.get(o["id"]) or kommune_af_dagi.get(p["dagi_id"])
-            kilde = "valg.dk" if o["id"] in kom_af_id else "dagi-id"
-            if not kom:
-                pt = indre_punkt(polygoner(g, buer))
-                hits = [k for k, polys in kommune_polys.items() if i_polygon(pt, polys)]
-                kom = hits[0] if len(hits) == 1 else None
-                kilde = "kort"
+    la_kandidater = {}
+    for sk in menu:
+        sk_områder = []
+        for kreds in sk["children"]:
+            kn = kredsnavn(kreds["title"])
+            kd = json.loads((raw / f"kreds_{kreds['id']}.json").read_text())
+            summer = defaultdict(int)
+            pr_navn = defaultdict(list)
+            for o in kreds["children"]:
+                r = læs_område(raw / f"omr_{o['id']}.json")
+                pr_navn[norm(r["navn"])].append((o, r))
+            for navn_n, lst in pr_navn.items():
+                o, r = lst[0]
+                if len(lst) > 1:
+                    r = læg_sammen([x[1] for x in lst])
+                g = kort_idx.get((kn, navn_n))
+                if g is not None and g.get("sammenlagt", 1) != len(lst):
+                    fejl(f"{kode}: {r['navn']}: {len(lst)} valg.dk-områder, {g.get('sammenlagt', 1)} kortområder")
+                if g is None:
+                    fejl(f"{kode}: intet kortområde for {kreds['title']} / {r['navn']}")
+                    continue
+                brugte.add(id(g))
+                p = g["properties"]
+                kom = kom_af_id.get(o["id"]) or kommune_af_dagi.get(p["dagi_id"])
+                kilde = "valg.dk" if o["id"] in kom_af_id else "dagi-id"
                 if not kom:
-                    fejl(f"{kode}: ingen kommune for {r['navn']} ({hits})")
-            for b, n in r["partier"].items():
-                summer[b] += n
-            la_kand = {navn: n for (b, navn), n in r["kandidater"].items() if b == LA}
-            for (b, navn), n in r["kandidater"].items():
-                if b == LA:
+                    pt = indre_punkt(polygoner(g, buer))
+                    hits = [k for k, (bb, polys) in kommune_polys.items() if i_bbox(pt, bb) and i_polygon(pt, polys)]
+                    kilde = "kort"
+                    if not hits:  # forenklet kystlinje: brug FV26-området, punktet ligger i
+                        hits = list({k for k, bb, polys in område26_polys if i_bbox(pt, bb) and i_polygon(pt, polys)})
+                        kilde = "kort-fv26"
+                    kom = hits[0] if len(hits) == 1 else None
+                    if not kom:
+                        fejl(f"{kode}: ingen kommune for {r['navn']} ({hits})")
+                for b, n in r["partier"].items():
+                    summer[b] += n
+                la_kand = {navn: n for (b, navn), n in r["kandidater"].items() if b == LA}
+                for navn, n in la_kand.items():
                     summer[("k", navn)] += n
-            if not la_kand_orden:
-                la_kand_orden = list(la_kand)
-            for bn in r["kandidater"]:
-                if bn not in alle_idx:
-                    alle_idx[bn] = len(alle_idx)
-            områder.append({
-                "id": omr_id(p),
-                "navn": r["navn"],
-                "kreds": p["opstillingskredsnavn"],
-                "kommune": kom,
-                "kommune_kilde": kilde,
-                "stemmested": r["stemmested"],
-                "adresse": r["adresse"],
-                "stemmeberettigede": r["stemmeberettigede"],
-                "afgivne": r["afgivne"],
-                "gyldige": r["gyldige"],
-                "partier": r["partier"],
-                "la": r["partier"].get(LA, 0),
-                "la_partistemmer": r["la_partistemmer"],
-                "la_kandidater": la_kand,
-                "alle_kandidater": {alle_idx[bn]: n for bn, n in r["kandidater"].items() if n},
-            })
-        # kontrol mod valg.dk's kredstal
-        for p in kd["partyDetailDto"]:
-            b = parti_bogstav(p["partyWholeName"])
-            if b and summer[b] != p["totalOfVotes"]:
-                fejl(f"{kode} {kreds['title']}: parti {b} områdesum {summer[b]} ≠ kreds {p['totalOfVotes']}")
-            if b == LA:
-                for c in p["candidateDetailDtos"]:
-                    if summer[("k", c["name"])] != c["candidateVotes"]:
-                        fejl(f"{kode} {kreds['title']}: {c['name']} {summer[('k', c['name'])]} ≠ {c['candidateVotes']}")
+                for bn in r["kandidater"]:
+                    if bn not in alle_idx:
+                        alle_idx[bn] = len(alle_idx)
+                o_ud = {
+                    "id": omr_id(p),
+                    "navn": r["navn"],
+                    "storkreds": p["storkredsnavn"],
+                    "kreds": p["opstillingskredsnavn"],
+                    "kommune": kom,
+                    "kommune_kilde": kilde,
+                    "stemmested": r["stemmested"],
+                    **({"sammenlagt": r["sammenlagt"]} if r.get("sammenlagt") else {}),
+                    "adresse": r["adresse"],
+                    "stemmeberettigede": r["stemmeberettigede"],
+                    "afgivne": r["afgivne"],
+                    "gyldige": r["gyldige"],
+                    "partier": r["partier"],
+                    "la": r["partier"].get(LA, 0),
+                    "la_partistemmer": r["la_partistemmer"],
+                    "la_kandidater": la_kand,
+                    "alle_kandidater": {alle_idx[bn]: n for bn, n in r["kandidater"].items() if n},
+                }
+                områder.append(o_ud)
+                sk_områder.append(o_ud)
+            # kontrol mod valg.dk's kredstal
+            for p in kd["partyDetailDto"]:
+                b = parti_bogstav(p["partyWholeName"])
+                if b and summer[b] != p["totalOfVotes"]:
+                    fejl(f"{kode} {kreds['title']}: parti {b} områdesum {summer[b]} ≠ kreds {p['totalOfVotes']}")
+                if b == LA:
+                    for c in p["candidateDetailDtos"]:
+                        if summer[("k", c["name"])] != c["candidateVotes"]:
+                            fejl(f"{kode} {kreds['title']}: {c['name']} {summer[('k', c['name'])]} ≠ {c['candidateVotes']}")
+        if not sk_områder:
+            continue
+        sknavn = sk_områder[0]["storkreds"]
+        if any(o["storkreds"] != sknavn for o in sk_områder):
+            fejl(f"{kode}: valg.dk-storkredsen {sk['title']} spænder over flere kort-storkredse")
+
+        # kandidater i storkredsen efter personlige stemmer; kontrol mod DST
+        tot = defaultdict(int)
+        for o in sk_områder:
+            for n, v in o["la_kandidater"].items():
+                tot[n] += v
+        kand = sorted(tot, key=lambda n: -tot[n])
+        dst = dst_kandidater(kode, sknavn)
+        if set(dst) != set(kand):
+            fejl(f"{kode} {sknavn}: kandidater hos DST {sorted(dst)} ≠ valg.dk {sorted(kand)}")
+        for n in kand:
+            if n in dst and dst[n]["personlige"] != tot[n]:
+                fejl(f"{kode} {sknavn}: {n} har {tot[n]} personlige stemmer hos valg.dk, {dst[n]['personlige']} hos DST")
+        la_kandidater[sknavn] = [{"navn": n, "stemmer": tot[n], **{k: v for k, v in dst.get(n, {}).items() if k != "personlige"}}
+                                 for n in kand]
+        la = sum(o["la"] for o in sk_områder)
+        gyl = sum(o["gyldige"] for o in sk_områder)
+        print(f"{kode} {sknavn}: {len(sk_områder)} områder, LA {la}/{gyl} ({la / gyl:.2%}), {len(kand)} kandidater, top: {kand[0] if kand else '–'}")
+
     for g in geoms:
         if id(g) not in brugte:
-            fejl(f"{kode}: kortområde uden resultat: {g['properties']['navn']}")
+            fejl(f"{kode}: kortområde uden resultat: {g['properties']['storkredsnavn']} / {g['properties']['navn']}")
 
-    # rækkefølge på kandidater: efter samlede personlige stemmer i storkredsen
-    tot = defaultdict(int)
-    for o in områder:
-        for n, v in o["la_kandidater"].items():
-            tot[n] += v
-    kand = sorted(tot, key=lambda n: -tot[n])
-    dst = dst_kandidater(kode)
-    if set(dst) != set(kand):
-        fejl(f"{kode}: kandidater hos DST {sorted(dst)} ≠ valg.dk {sorted(kand)}")
-    for n in kand:
-        if n in dst and dst[n]["personlige"] != tot[n]:
-            fejl(f"{kode}: {n} har {tot[n]} personlige stemmer hos valg.dk, {dst[n]['personlige']} hos DST")
-
-    # kortet: kun storkredsens geometrier; id = dagi_id
-    ud_geoms = [{"type": g["type"], "arcs": g["arcs"], "id": omr_id(g["properties"]),
-                 "properties": {"navn": g["properties"]["navn"]}} for g in geoms]
+    ud_geoms = [{"type": g["type"], "arcs": g["arcs"], "id": omr_id(g["properties"])} for g in geoms if id(g) in brugte]
     (UD / f"kort_{kode}.json").write_text(json.dumps(beskaar_topologi(topo, "omr", ud_geoms), separators=(",", ":")))
 
     la = sum(o["la"] for o in områder)
     gyl = sum(o["gyldige"] for o in områder)
-    print(f"{kode}: {len(områder)} områder, LA {la} af {gyl} gyldige ({la / gyl:.2%}); kandidater: {', '.join(f'{n} {tot[n]}' for n in kand)}")
+    print(f"{kode}: {len(områder)} områder i alt, LA {la} af {gyl} gyldige ({la / gyl:.2%})")
     return {
         **{k: v for k, v in cfg.items() if k != "kort"},
         "kandidater": [[b, n] for (b, n) in alle_idx],
         "partinavne": partinavne(raw),
-        "la_kandidater": [{"navn": n, "stemmer": tot[n], **{k: v for k, v in dst.get(n, {}).items() if k != "personlige"}}
-                          for n in kand],
+        "la_kandidater": la_kandidater,
         "omraader": områder,
     }
+
+
+def kommunenavn(s):
+    s = re.sub(r"\s+(Kommune|Regionskommune)$", "", s.strip())
+    return {"Københavns": "København", "Bornholms": "Bornholm"}.get(s, s)
+
+
+def bbox_af(polys):
+    xs = [x for p in polys for x, _ in p[0]]
+    ys = [y for p in polys for _, y in p[0]]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def i_bbox(pt, bb):
+    return bb[0] <= pt[0] <= bb[2] and bb[1] <= pt[1] <= bb[3]
 
 
 def kobl_forrige(nu, før):
@@ -345,51 +413,67 @@ def kobl_forrige(nu, før):
         b = ringe_abs(topo)
         return {g["id"]: polygoner(g, b) for g in topo["objects"]["omr"]["geometries"]}
     p_nu, p_før = polys("fv26"), polys("fv22")
+    bb_nu = {nid: bbox_af(pp) for nid, pp in p_nu.items()}
     forgængere = defaultdict(list)
     for fid, pp in p_før.items():
         pt = indre_punkt(pp)
-        hits = [nid for nid, np_ in p_nu.items() if i_polygon(pt, np_)]
+        hits = [nid for nid, np_ in p_nu.items() if i_bbox(pt, bb_nu[nid]) and i_polygon(pt, np_)]
         if len(hits) != 1:
             fejl(f"FV22-område {fid} ligger i {len(hits)} FV26-områder")
             continue
         forgængere[hits[0]].append(fid)
     før_af = {o["id"]: o for o in før["omraader"]}
+    afvist = 0
     for o in nu["omraader"]:
         f = sorted(forgængere.get(o["id"], []), key=lambda i: i != o["id"])
+        # Er områdets vælgertal ændret mere end 20 %, er geografien ikke den samme (fx delte
+        # områder, hvor kun den ene del fik forgængeren) – så sammenlignes der ikke.
+        if f and abs(o["stemmeberettigede"] / sum(før_af[i]["stemmeberettigede"] for i in f) - 1) > 0.2:
+            afvist += 1
+            f = []
         o["forrige"] = f
-        if f and f != [o["id"]]:
-            sb = sum(før_af[i]["stemmeberettigede"] for i in f)
-            print(f"  {o['navn']}: sammenlignes med {[før_af[i]['navn'] for i in f]} "
-                  f"(stemmeberettigede {sb} → {o['stemmeberettigede']})")
+    flere = sum(len(o["forrige"]) > 1 for o in nu["omraader"])
+    uden = sum(not o["forrige"] for o in nu["omraader"])
+    print(f"forrige valg: {len(nu['omraader']) - uden} FV26-områder sammenlignes ({flere} med flere "
+          f"forgængere), {uden} uden sammenligning (heraf {afvist} afvist pga. vælgertal)")
 
 
 def main():
     # kommuner pr. DAGI-id fra FV26 (valg.dk's egen kommunemenu) til brug for FV22
     raw26 = RAW / "fv26"
-    kom_af_id = {oid: k["navn"].replace(" Kommune", "")
+    kom_af_id = {oid: kommunenavn(k["navn"])
                  for k in json.loads((raw26 / "kommuner.json").read_text()) for oid in k["omraader"]}
     topo26 = json.loads((RAW / "geo" / f"{VALG['fv26']['kort']}.topojson").read_text())
     menu26 = json.loads((raw26 / "menu.json").read_text())
     navn_til_id = {(kredsnavn(k["title"]), norm(json.loads((raw26 / f"omr_{o['id']}.json").read_text())["countStatusDto"]["name"])): o["id"]
-                   for k in menu26["children"] for o in k["children"]}
+                   for sk in menu26 for k in sk["children"] for o in k["children"]}
     kommune_af_dagi = {}
+    område26_polys = []
+    b26 = ringe_abs(topo26)
     for g in topo26["objects"][VALG["fv26"]["kort"]]["geometries"]:
         p = g["properties"]
         oid = navn_til_id.get((kredsnavn(p["opstillingskredsnavn"]), norm(p["navn"])))
         if oid:
             kommune_af_dagi[p["dagi_id"]] = kom_af_id[oid]
+            pp = polygoner(g, b26)
+            område26_polys.append((kom_af_id[oid], bbox_af(pp), pp))
 
     # kommunepolygoner (DAGI, KV25) til punkt-i-polygon for områder uden match
     tk = json.loads((RAW / "geo" / "kv25_kommuner_simpel.topojson").read_text())
     kb = ringe_abs(tk)
     kommuner = set(kom_af_id.values())
-    kommune_polys = {g["properties"]["navn"]: polygoner(g, kb)
-                     for g in tk["objects"]["kv25_kommuner_simpel"]["geometries"] if g["properties"]["navn"] in kommuner}
+    kommune_polys = {}
+    for g in tk["objects"]["kv25_kommuner_simpel"]["geometries"]:
+        navn = kommunenavn(g["properties"]["navn"])
+        if navn in kommuner:
+            pp = polygoner(g, kb)
+            kommune_polys[navn] = (bbox_af(pp), pp)
+    if kommuner - set(kommune_polys):
+        fejl(f"kommuner uden kort: {sorted(kommuner - set(kommune_polys))}")
 
     ud = {
         "meta": {
             "bygget": date.today().isoformat(),
-            "storkreds": "Nordsjællands Storkreds",
             "parti": "I. Liberal Alliance",
             "kilder": {
                 "resultater": "valg.dk (KOMBIT/Netcompany), fintælling pr. afstemningsområde",
@@ -397,7 +481,7 @@ def main():
                 "kort": "DAGI (Klimadatastyrelsen) via ValgTal's forenklede kort over afstemningsområder",
             },
         },
-        "valg": {k: byg_valg(k, cfg, kommune_af_dagi, kommune_polys) for k, cfg in VALG.items()},
+        "valg": {k: byg_valg(k, cfg, kommune_af_dagi, kommune_polys, område26_polys) for k, cfg in VALG.items()},
     }
     kobl_forrige(ud["valg"]["fv26"], ud["valg"]["fv22"])
     if FEJL:

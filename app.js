@@ -1,7 +1,7 @@
 'use strict';
-/* LA i Nordsjællands Storkreds – interaktivt valgkort.
+/* Liberal Alliance ved folketingsvalgene – interaktivt valgkort for hele landet.
    Data: data/valg.json (scripts/byg.py) + data/kort_<valg>.json (TopoJSON).
-   Niveauer: storkreds → kommune (eller opstillingskreds) → afstemningsområde. */
+   Niveauer: Danmark → storkreds → kommune (eller opstillingskreds) → afstemningsområde. */
 
 const CONFIG = {
   basemap: 'https://tiles.openfreemap.org/styles/liberty',
@@ -13,7 +13,7 @@ const FORRIGE = {fv26: 'fv22'};
 
 // Farver (dataviz-referencepaletten, samme som lau-kort). Sekventiel: én blå rampe, lys → mørk.
 const BLAA = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b'];
-const ANDEL_GRAENSER = [6, 8, 10, 12, 15, 20];             // pct. → 7 klasser
+const ANDEL_GRAENSER = [5, 7, 9, 11, 13, 16];             // pct. → 7 klasser
 // Divergerende (ændring i pct.-point): rød ↔ grå midte ↔ blå, lige mange trin pr. arm.
 const DIV = ['#b8302f', '#e8807f', '#f6c9c8', '#f0efec', '#cde2fb', '#6da7ec', '#256abf'];
 const DIV_GRAENSER = [-3, -1.5, -0.5, 0.5, 1.5, 3];
@@ -26,15 +26,17 @@ const INGEN = '#e1e0d9';
 const FARVNINGER = [
   {id: 'andel', navn: 'LA-andel'},
   {id: 'aendring', navn: 'Ændring'},
-  {id: 'top', navn: 'Største LA-kandidat'},
-  {id: 'kandidat', navn: 'Én kandidat'},
+  {id: 'top', navn: 'Største LA-kandidat', kraeverSk: true},
+  {id: 'kandidat', navn: 'Én kandidat', kraeverSk: true},
 ];
 const NIVEAUER = [
   {id: 'omr', navn: 'Afstemningsområder'},
   {id: 'kommune', navn: 'Kommuner'},
+  {id: 'storkreds', navn: 'Storkredse'},
 ];
+const GRUPPE_PREFIX = {kommune: 'k:', storkreds: 's:', kreds: 'o:'};
 
-const S = {valg: 'fv26', farve: 'andel', kandidat: null, niveau: 'omr', gruppe: null, omr: null, sort: 'andel'};
+const S = {valg: 'fv26', farve: 'andel', kandidat: null, niveau: 'omr', sk: null, gruppe: null, omr: null, sort: 'andel'};
 let D = null;            // valg.json
 const E = {};            // forberedte data pr. valg
 let MAP = null;
@@ -51,6 +53,7 @@ const ppKort = (x) => x == null || !isFinite(x) ? '–' : (x > 0 ? '+' : x < 0 ?
 const fortegn = (n) => (n > 0 ? '+' : n < 0 ? '−' : '±') + int(Math.abs(n));
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
 const klasse = (v, graenser) => { let i = 0; while (i < graenser.length && v >= graenser[i]) i++; return i; };
+const kortSk = (navn) => navn.replace(/s? Storkreds$/, '');   // "Nordsjællands Storkreds" → "Nordsjælland"
 
 // ---------- data ----------
 async function hentJson(f) {
@@ -73,34 +76,62 @@ function sum(omraader) {
 
 function forbered(kode, topo) {
   const v = D.valg[kode];
-  const e = {kode, v, omr: new Map(), grupper: {kommune: new Map(), kreds: new Map()}};
+  const e = {kode, v, omr: new Map(), grupper: {storkreds: new Map(), kommune: new Map(), kreds: new Map()}};
   for (const o of v.omraader) {
     o.alle = o.alle_kandidater;
     e.omr.set(o.id, o);
-    for (const [type, navn] of [['kommune', o.kommune], ['kreds', o.kreds]]) {
+    for (const type of ['storkreds', 'kommune', 'kreds']) {
+      const navn = o[type];
       if (!e.grupper[type].has(navn)) e.grupper[type].set(navn, {type, navn, omraader: []});
       e.grupper[type].get(navn).omraader.push(o);
     }
   }
   for (const m of Object.values(e.grupper)) for (const g of m.values()) {
     Object.assign(g, sum(g.omraader));
+    g.id = GRUPPE_PREFIX[g.type] + g.navn;
+    g.storkredse = [...new Set(g.omraader.map((o) => o.storkreds))];
     g.kredse = [...new Set(g.omraader.map((o) => o.kreds))];
     g.kommuner = [...new Set(g.omraader.map((o) => o.kommune))];
   }
   e.total = sum(v.omraader);
   const obj = topo.objects.omr;
   e.features = topojson.feature(topo, obj).features;
-  for (const f of e.features) f.properties.id = f.id;
-  // kommuner som sammenlagte områder + grænser mellem kommuner/ydergrænsen
+  for (const f of e.features) f.properties = {id: f.id};
   const geomAf = new Map(obj.geometries.map((g) => [g.id, g]));
-  e.komFeatures = [...e.grupper.kommune.values()].map((g) => ({
-    type: 'Feature', id: 'k:' + g.navn, properties: {id: 'k:' + g.navn, navn: g.navn},
-    geometry: rens(topojson.merge(topo, g.omraader.map((o) => geomAf.get(o.id)))),
-  }));
-  e.komGraenser = {type: 'FeatureCollection', features: e.komFeatures};
-  e.kredsGraenser = topojson.mesh(topo, obj, (a, b) => a !== b && e.omr.get(a.id).kreds !== e.omr.get(b.id).kreds);
-  e.komLabels = e.komFeatures.map((f) => ({type: 'Feature', properties: {navn: f.properties.navn}, geometry: {type: 'Point', coordinates: midtpunkt(f.geometry)}}));
-  e.bbox = bbox(e.features);
+  const featAf = new Map(e.features.map((f) => [f.id, f]));
+  // Kommuner/storkredse som sammenlagte områder – kun til omrids, navne og zoom. Den forenklede
+  // topologi er ikke altid ren; giver sammenlægningen et forkert areal, bruges områderne direkte.
+  const flet = (g) => {
+    const dele = g.omraader.map((o) => featAf.get(o.id)).filter(Boolean);
+    const delAreal = dele.reduce((t, f) => t + polyAreal(f.geometry), 0);
+    let geom = rens(topojson.merge(topo, g.omraader.map((o) => geomAf.get(o.id)).filter(Boolean)));
+    let omrids = null;
+    // ugyldig sammenlægning: forkert areal, eller lange kanter, som ingen af områderne har
+    const delKant = Math.max(...dele.map((f) => maxKant(f.geometry)));
+    if (Math.abs(polyAreal(geom) / delAreal - 1) > 0.05 || maxKant(geom) > delKant * 1.01 || aabenRing(geom)) {
+      geom = {type: 'MultiPolygon', coordinates: dele.flatMap((f) => f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates)};
+      // omrids = gruppens ydre buer (mod naboer og kyst); små løkker fra huller i topologien droppes
+      const ind = new Set(g.omraader.map((o) => o.id));
+      const m = topojson.mesh(topo, obj, (a, b) => ind.has(a.id) !== ind.has(b.id) || (a === b && ind.has(a.id)));
+      const laengde = (l) => l.slice(1).reduce((t, pt, i) => t + Math.hypot(pt[0] - l[i][0], pt[1] - l[i][1]), 0);
+      omrids = {type: 'MultiLineString', coordinates: m.coordinates.filter((l) => laengde(l) > 0.1)};
+    }
+    return {type: 'Feature', id: g.id, properties: {id: g.id, navn: g.navn}, geometry: geom, omrids};
+  };
+  e.gruppeFeatures = {
+    kommune: [...e.grupper.kommune.values()].map(flet),
+    storkreds: [...e.grupper.storkreds.values()].map(flet),
+  };
+  e.featureAf = new Map([...e.features, ...e.gruppeFeatures.kommune, ...e.gruppeFeatures.storkreds].map((f) => [f.id, f]));
+  // Grænser kun mellem nabo-områder (ydergrænser i den forenklede topologi giver splinter).
+  const af = (g) => e.omr.get(g.id);
+  e.skGraenser = topojson.mesh(topo, obj, (a, b) => a !== b && af(a).storkreds !== af(b).storkreds);
+  e.komGraenser = topojson.mesh(topo, obj, (a, b) => a !== b && af(a).kommune !== af(b).kommune);
+  e.kredsGraenser = topojson.mesh(topo, obj, (a, b) => a !== b && af(a).kreds !== af(b).kreds && af(a).kommune === af(b).kommune);
+  const label = (f, navn) => ({type: 'Feature', properties: {navn}, geometry: {type: 'Point', coordinates: midtpunkt(f.geometry)}});
+  e.skLabels = e.gruppeFeatures.storkreds.map((f) => label(f, kortSk(f.properties.navn)));
+  e.komLabels = e.gruppeFeatures.kommune.map((f) => ({...label(f, f.properties.navn), sk: e.grupper.kommune.get(f.properties.navn).storkredse}));
+  e.bbox = bbox(e.features.filter((f) => af(f).storkreds !== 'Bornholms Storkreds'));
   return e;
 }
 
@@ -130,38 +161,44 @@ function aendring(u) {
 function topKandidat(u) {
   const r = Object.entries(u.la_kandidater).sort((a, b) => b[1] - a[1]);
   if (!r.length || r[0][1] === 0) return {navn: null, stemmer: 0};
-  return {navn: r[0][1] === r[1]?.[1] ? null : r[0][0], stemmer: r[0][1], delt: r[0][1] === r[1]?.[1] ? r.filter((x) => x[1] === r[0][1]).map((x) => x[0]) : null};
+  const delt = r[0][1] === r[1]?.[1];
+  return {navn: delt ? null : r[0][0], stemmer: r[0][1], delt: delt ? r.filter((x) => x[1] === r[0][1]).map((x) => x[0]) : null};
 }
 const kandAndel = (u, k) => u.la ? (u.la_kandidater[k] || 0) / u.la * 100 : null;
+const iSk = (o) => !S.sk || o.storkreds === S.sk || (o.storkredse && o.storkredse.includes(S.sk));
+const kandidaterISk = () => (S.sk && E[S.valg].v.la_kandidater[S.sk]) || [];
 
-const KAND_FARVE = {};    // pr. valg: kandidat → farve
+const KAND_FARVE = {};    // pr. valg og storkreds: kandidat → farve
 function kandidatFarver() {
-  // De fire LA-kandidater, der "vandt" flest områder ved hvert valg, får en farve. En kandidat
-  // beholder sin farve på tværs af valgene; ledige pladser fyldes efter antal vundne områder.
-  const fast = new Map();
-  for (const kode of Object.keys(E)) {
-    const t = new Map();
-    for (const o of E[kode].omr.values()) {
-      const k = topKandidat(o).navn;
-      if (k) t.set(k, (t.get(k) || 0) + 1);
+  // I hver storkreds får de fire LA-kandidater, der "vandt" flest områder ved hvert valg, en farve.
+  // En kandidat beholder sin farve på tværs af valgene; ledige pladser fyldes efter antal vundne områder.
+  for (const sk of Object.keys(D.valg.fv26.la_kandidater)) {
+    const fast = new Map();
+    for (const kode of Object.keys(E)) {
+      const t = new Map();
+      for (const o of E[kode].omr.values()) {
+        if (o.storkreds !== sk) continue;
+        const k = topKandidat(o).navn;
+        if (k) t.set(k, (t.get(k) || 0) + 1);
+      }
+      const top = [...t.entries()].sort((a, b) => b[1] - a[1]).slice(0, KAT.length).map(([k]) => k);
+      const m = new Map();
+      for (const k of top) if (fast.has(k)) m.set(k, fast.get(k));
+      for (const k of top) if (!m.has(k)) {
+        const brugt = [...m.values()];
+        const ledig = KAT.find((c) => !brugt.includes(c) && ![...fast.values()].includes(c)) || KAT.find((c) => !brugt.includes(c));
+        m.set(k, ledig);
+        if (!fast.has(k)) fast.set(k, ledig);
+      }
+      (KAND_FARVE[kode] ||= {})[sk] = new Map(top.map((k) => [k, m.get(k)]));
     }
-    const top = [...t.entries()].sort((a, b) => b[1] - a[1]).slice(0, KAT.length).map(([k]) => k);
-    const m = new Map();
-    for (const k of top) if (fast.has(k)) m.set(k, fast.get(k));
-    for (const k of top) if (!m.has(k)) {
-      const ledig = KAT.find((c) => ![...m.values()].includes(c) && ![...fast.values()].includes(c)) || KAT.find((c) => ![...m.values()].includes(c));
-      m.set(k, ledig);
-      if (!fast.has(k)) fast.set(k, ledig);
-    }
-    KAND_FARVE[kode] = new Map(top.map((k) => [k, m.get(k)]));
   }
 }
-const kandFarve = (k) => k == null ? UAFGJORT : KAND_FARVE[S.valg].get(k) || ANDRE;
+const kandFarve = (k) => k == null ? UAFGJORT : KAND_FARVE[S.valg]?.[S.sk]?.get(k) || ANDRE;
 
 function kandSkala() {
-  // kontinuert blå skala 0 → højeste andel blandt områderne (afrundet op)
-  const e = E[S.valg];
-  const max = Math.max(...[...e.omr.values()].map((o) => kandAndel(o, S.kandidat) || 0));
+  const omr = [...E[S.valg].omr.values()].filter((o) => o.storkreds === S.sk);
+  const max = Math.max(0, ...omr.map((o) => kandAndel(o, S.kandidat) || 0));
   const trin = [0.5, 1, 2, 2.5, 3, 4, 5, 10].find((t) => t * 7 >= max) || 10;
   return {top: trin * 7, graenser: [1, 2, 3, 4, 5, 6].map((i) => i * trin)};
 }
@@ -171,8 +208,8 @@ function farveAf(u, skala) {
   switch (S.farve) {
     case 'andel': return BLAA[klasse(andel(u), ANDEL_GRAENSER)];
     case 'aendring': { const d = aendring(u); return d == null ? INGEN : DIV[klasse(d, DIV_GRAENSER)]; }
-    case 'top': return kandFarve(topKandidat(u).navn);
-    case 'kandidat': return BLAA[klasse(kandAndel(u, S.kandidat) ?? 0, skala.graenser)];
+    case 'top': return iSk(u) ? kandFarve(topKandidat(u).navn) : INGEN;
+    case 'kandidat': return iSk(u) ? BLAA[klasse(kandAndel(u, S.kandidat) ?? 0, skala.graenser)] : INGEN;
   }
   return INGEN;
 }
@@ -208,6 +245,17 @@ function ringAreal(r) {
   for (let i = 0, j = r.length - 1; i < r.length; j = i++) a += r[j][0] * r[i][1] - r[i][0] * r[j][1];
   return Math.abs(a) / 2;
 }
+const polyAreal = (geom) => (geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates)
+  .reduce((t, p) => t + ringAreal(p[0]) - p.slice(1).reduce((u, h) => u + ringAreal(h), 0), 0);
+const aabenRing = (geom) => (geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates)
+  .some((p) => p.some((r) => Math.hypot(r[0][0] - r[r.length - 1][0], r[0][1] - r[r.length - 1][1]) > 1e-3));
+function maxKant(geom) {
+  let m = 0;
+  for (const p of (geom.type === 'Polygon' ? [geom.coordinates] : geom.coordinates)) for (const r of p) {
+    for (let i = 1; i < r.length; i++) m = Math.max(m, Math.hypot(r[i][0] - r[i - 1][0], r[i][1] - r[i - 1][1]));
+  }
+  return m;
+}
 function rens(geom) {
   // Sammenlægning af forenklede områder efterlader små huller/splinter langs de indre grænser – fjern dem.
   const MIN = 2e-6; // grader² (ca. 0,015 km²)
@@ -237,17 +285,18 @@ function laesHash() {
   const p = new URLSearchParams(location.hash.slice(1));
   S.valg = p.get('valg') in D.valg ? p.get('valg') : Object.keys(D.valg)[0];
   S.farve = FARVNINGER.some((f) => f.id === p.get('farve')) ? p.get('farve') : 'andel';
-  if (S.farve === 'aendring' && !FORRIGE[S.valg]) S.farve = 'andel';
   S.niveau = NIVEAUER.some((f) => f.id === p.get('niveau')) ? p.get('niveau') : 'omr';
   S.kandidat = p.get('kandidat') || null;
   const e = E[S.valg];
+  S.sk = e.grupper.storkreds.has(p.get('sk')) ? p.get('sk') : null;
   S.gruppe = null; S.omr = null;
   for (const type of ['kommune', 'kreds']) if (p.get(type) && e.grupper[type].has(p.get(type))) S.gruppe = {type, navn: p.get(type)};
   if (p.get('omr') && e.omr.has(p.get('omr'))) {
     S.omr = p.get('omr');
     if (!S.gruppe) S.gruppe = {type: 'kommune', navn: e.omr.get(S.omr).kommune};
   }
-  sikrKandidat();
+  if (S.gruppe && !S.sk) S.sk = e.grupper[S.gruppe.type].get(S.gruppe.navn).storkredse[0];
+  ret();
 }
 function skrivHash() {
   const p = new URLSearchParams();
@@ -255,13 +304,18 @@ function skrivHash() {
   if (S.farve !== 'andel') p.set('farve', S.farve);
   if (S.farve === 'kandidat' && S.kandidat) p.set('kandidat', S.kandidat);
   if (S.niveau !== 'omr') p.set('niveau', S.niveau);
+  if (S.sk) p.set('sk', S.sk);
   if (S.gruppe) p.set(S.gruppe.type, S.gruppe.navn);
   if (S.omr) p.set('omr', S.omr);
   history.replaceState(null, '', '#' + p.toString());
 }
-function sikrKandidat() {
-  const navne = E[S.valg].v.la_kandidater.map((k) => k.navn);
-  if (!navne.includes(S.kandidat)) S.kandidat = navne[0];
+function ret() {
+  // hold tilstanden konsistent: farvninger, der kræver en storkreds, og en gyldig kandidat
+  if (S.farve === 'aendring' && !FORRIGE[S.valg]) S.farve = 'andel';
+  if (!S.sk && FARVNINGER.find((f) => f.id === S.farve).kraeverSk) S.farve = 'andel';
+  if (S.sk && S.niveau === 'storkreds') S.niveau = 'kommune';
+  const navne = kandidaterISk().map((k) => k.navn);
+  if (!navne.includes(S.kandidat)) S.kandidat = navne[0] || null;
 }
 
 // ---------- kort ----------
@@ -275,34 +329,36 @@ function initKort() {
   MAP.on('load', () => {
     const firstSymbol = MAP.getStyle().layers.find((l) => l.type === 'symbol')?.id;
     const tom = {type: 'FeatureCollection', features: []};
-    MAP.addSource('enheder', {type: 'geojson', data: tom, promoteId: 'id'});
-    MAP.addSource('kom-graenser', {type: 'geojson', data: tom});
-    MAP.addSource('kreds-graenser', {type: 'geojson', data: tom});
-    MAP.addSource('kom-labels', {type: 'geojson', data: tom});
-    MAP.addSource('valgt', {type: 'geojson', data: tom});
+    for (const s of ['enheder', 'omr-linjer', 'sk-graenser', 'kom-graenser', 'kreds-graenser', 'labels', 'valgt']) {
+      MAP.addSource(s, {type: 'geojson', data: tom, ...(s === 'enheder' ? {promoteId: 'id', tolerance: 0.1} : {})});
+    }
     MAP.addLayer({id: 'fyld', type: 'fill', source: 'enheder', paint: {
-      'fill-color': ['get', 'farve'],
+      'fill-color': ['get', 'farve'], 'fill-outline-color': ['get', 'farve'],
       'fill-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.92, ['get', 'opacitet']],
     }}, firstSymbol);
-    MAP.addLayer({id: 'omr-linjer', type: 'line', source: 'enheder', paint: {
+    MAP.addLayer({id: 'omr-linjer', type: 'line', source: 'omr-linjer', minzoom: 7.5, layout: {'line-join': 'round', 'line-cap': 'round'}, paint: {
       'line-color': '#ffffff', 'line-opacity': 0.85,
-      'line-width': ['interpolate', ['linear'], ['zoom'], 8, 0.4, 12, 1.4],
+      'line-width': ['interpolate', ['linear'], ['zoom'], 8, 0.3, 12, 1.4],
     }}, firstSymbol);
-    MAP.addLayer({id: 'kreds-linjer', type: 'line', source: 'kreds-graenser', paint: {
-      'line-color': '#1f2937', 'line-opacity': 0.55, 'line-dasharray': [3, 2],
+    MAP.addLayer({id: 'kreds-linjer', type: 'line', source: 'kreds-graenser', minzoom: 8.5, layout: {'line-join': 'round', 'line-cap': 'round'}, paint: {
+      'line-color': '#1f2937', 'line-opacity': 0.5, 'line-dasharray': [3, 2],
       'line-width': ['interpolate', ['linear'], ['zoom'], 8, 0.8, 12, 1.6],
     }}, firstSymbol);
-    MAP.addLayer({id: 'kom-linjer', type: 'line', source: 'kom-graenser', paint: {
-      'line-color': '#334155', 'line-opacity': 0.85,
-      'line-width': ['interpolate', ['linear'], ['zoom'], 8, 1, 12, 2.4],
+    MAP.addLayer({id: 'kom-linjer', type: 'line', source: 'kom-graenser', layout: {'line-join': 'round', 'line-cap': 'round'}, paint: {
+      'line-color': '#334155', 'line-opacity': ['interpolate', ['linear'], ['zoom'], 6, 0.35, 9, 0.85],
+      'line-width': ['interpolate', ['linear'], ['zoom'], 6, 0.5, 9, 1, 12, 2.4],
     }}, firstSymbol);
-    MAP.addLayer({id: 'hover-linje', type: 'line', source: 'enheder', paint: {
+    MAP.addLayer({id: 'sk-linjer', type: 'line', source: 'sk-graenser', layout: {'line-join': 'round', 'line-cap': 'round'}, paint: {
+      'line-color': '#0b0b0b', 'line-opacity': 0.8,
+      'line-width': ['interpolate', ['linear'], ['zoom'], 6, 1.2, 10, 2.6],
+    }}, firstSymbol);
+    MAP.addLayer({id: 'hover-linje', type: 'line', source: 'enheder', filter: ['!', ['in', ':', ['get', 'id']]], layout: {'line-join': 'round', 'line-cap': 'round'}, paint: {
       'line-color': '#0b0b0b', 'line-width': ['case', ['boolean', ['feature-state', 'hover'], false], 2, 0],
     }});
-    MAP.addLayer({id: 'valgt-linje', type: 'line', source: 'valgt', paint: {'line-color': '#0b0b0b', 'line-width': 3}});
-    MAP.addLayer({id: 'kom-navne', type: 'symbol', source: 'kom-labels', layout: {
+    MAP.addLayer({id: 'valgt-linje', type: 'line', source: 'valgt', layout: {'line-join': 'round', 'line-cap': 'round'}, paint: {'line-color': '#0b0b0b', 'line-width': 3}});
+    MAP.addLayer({id: 'navne', type: 'symbol', source: 'labels', layout: {
       'text-field': ['upcase', ['get', 'navn']], 'text-font': ['Noto Sans Bold'], 'text-letter-spacing': 0.08,
-      'text-size': ['interpolate', ['linear'], ['zoom'], 8, 10, 11, 14], 'text-allow-overlap': false,
+      'text-size': ['interpolate', ['linear'], ['zoom'], 6, 10, 11, 14], 'text-allow-overlap': false,
     }, paint: {'text-color': '#0b0b0b', 'text-halo-color': '#ffffff', 'text-halo-width': 1.8}});
 
     MAP.on('mousemove', 'fyld', (ev) => {
@@ -312,9 +368,9 @@ function initKort() {
       visTooltip(ev.originalEvent, enhedAf(f.id));
     });
     MAP.on('mouseleave', 'fyld', () => { setHover(null); MAP.getCanvas().style.cursor = ''; skjulTooltip(); });
-    MAP.on('click', 'fyld', (ev) => klikEnhed(ev.features[0].id));
     MAP.on('click', (ev) => {
-      if (!MAP.queryRenderedFeatures(ev.point, {layers: ['fyld']}).length && S.gruppe) vaelg(null, null);
+      const f = MAP.queryRenderedFeatures(ev.point, {layers: ['fyld']})[0];
+      if (f) klikEnhed(f.id); else op();
     });
     tegn(true);
   });
@@ -323,49 +379,66 @@ function initKort() {
 function setHover(id) {
   if (hoverId != null) MAP.setFeatureState({source: 'enheder', id: hoverId}, {hover: false});
   hoverId = id;
-  if (id != null) MAP.setFeatureState({source: 'enheder', id}, {hover: true});
+  if (id != null && MAP.getSource('enheder')) MAP.setFeatureState({source: 'enheder', id}, {hover: true});
   document.querySelectorAll('ul.rank li[data-id]').forEach((li) => li.classList.toggle('hover', li.dataset.id === id));
 }
 
 function enhedAf(id) {
   const e = E[S.valg];
-  if (String(id).startsWith('k:')) return e.grupper.kommune.get(id.slice(2));
+  for (const [type, pre] of Object.entries(GRUPPE_PREFIX)) if (String(id).startsWith(pre)) return e.grupper[type].get(id.slice(pre.length));
   return e.omr.get(id);
 }
 
 function klikEnhed(id) {
   const u = enhedAf(id);
   if (!u) return;
-  if (u.type) return vaelg(u.type, u.navn);              // kommuneniveau
+  if (u.type === 'storkreds') return vaelg(u.navn);
+  if (u.type === 'kommune') return u.storkredse.includes(S.sk) ? vaelg(S.sk, 'kommune', u.navn) : vaelg(u.storkredse[0]);
+  if (u.storkreds !== S.sk) return vaelg(u.storkreds);                    // Danmark → storkreds
   const g = S.gruppe;
   const iGruppe = g && (g.type === 'kommune' ? u.kommune === g.navn : u.kreds === g.navn);
-  if (iGruppe) vaelg(g.type, g.navn, u.id);              // inde i valgt kommune: åbn området
-  else vaelg('kommune', u.kommune);                      // ellers: åbn kommunen først
+  if (iGruppe) return vaelg(S.sk, g.type, g.navn, u.id);                 // inde i valgt kommune: åbn området
+  vaelg(S.sk, 'kommune', u.kommune);                                    // ellers: åbn kommunen
 }
 
-function vaelg(type, navn, omr = null) {
+function vaelg(sk, type = null, navn = null, omr = null) {
+  $('sidebar').scrollTop = 0;
+  S.sk = sk;
   S.gruppe = type ? {type, navn} : null;
   S.omr = omr;
+  ret();
   tegn(true);
+}
+function op() {
+  if (S.omr) vaelg(S.sk, S.gruppe.type, S.gruppe.navn);
+  else if (S.gruppe) vaelg(S.sk);
+  else if (S.sk) vaelg(null);
 }
 
 function kortData() {
   const e = E[S.valg];
   const skala = S.farve === 'kandidat' ? kandSkala() : null;
   const g = S.gruppe;
-  const aktiv = (o) => !g || (g.type === 'kommune' ? o.kommune === g.navn : o.kreds === g.navn);
+  const iGruppe = (o) => !g || (g.type === 'kommune' ? o.kommune === g.navn || (o.kommuner && o.kommuner.includes(g.navn)) : o.kreds === g.navn || (o.kredse && o.kredse.includes(g.navn)));
+  const opacitet = (u, farve) => farve === INGEN ? 0.12 : !iSk(u) ? 0.22 : iGruppe(u) ? 0.82 : 0.4;
+  // På kommune-/storkredsniveau bruges de sammenlagte polygoner; hvor sammenlægningen ikke er
+  // gyldig, farves gruppens områder i stedet (med gruppens id, så hover og klik gælder hele gruppen).
+  const egenskaber = (id) => {
+    const u = enhedAf(id);
+    const farve = farveAf(u, skala);
+    return {id, farve, opacitet: opacitet(u, farve)};
+  };
   let feats;
-  if (S.niveau === 'kommune') {
-    feats = e.komFeatures.map((f) => {
-      const u = e.grupper.kommune.get(f.properties.navn);
-      return {...f, properties: {...f.properties, farve: farveAf(u, skala), opacitet: !g || u.kommuner.some((k) => k === g.navn) || u.kredse.includes(g.navn) ? 0.82 : 0.4}};
-    });
+  if (S.niveau === 'omr') {
+    feats = e.features.map((f) => ({type: 'Feature', geometry: f.geometry, properties: egenskaber(f.id)}));
   } else {
-    feats = e.features.map((f) => {
-      const o = e.omr.get(f.id);
-      const farve = farveAf(o, skala);
-      return {...f, properties: {...f.properties, farve, opacitet: farve === INGEN ? 0.12 : aktiv(o) ? 0.82 : 0.38}};
-    });
+    const grupper = e.gruppeFeatures[S.niveau];
+    const brudte = new Set(grupper.filter((f) => f.omrids).map((f) => f.id));
+    feats = grupper.filter((f) => !brudte.has(f.id)).map((f) => ({type: 'Feature', geometry: f.geometry, properties: egenskaber(f.id)}));
+    for (const f of e.features) {
+      const id = GRUPPE_PREFIX[S.niveau] + e.omr.get(f.id)[S.niveau];
+      if (brudte.has(id)) feats.push({type: 'Feature', geometry: f.geometry, properties: egenskaber(id)});
+    }
   }
   return {feats, skala};
 }
@@ -377,9 +450,12 @@ function tegn(zoom = false) {
   if (MAP && MAP.getSource('enheder')) {
     const {feats, skala} = kortData();
     MAP.getSource('enheder').setData({type: 'FeatureCollection', features: feats});
+    MAP.getSource('omr-linjer').setData(S.niveau === 'omr' ? {type: 'FeatureCollection', features: e.features} : {type: 'FeatureCollection', features: []});
+    MAP.getSource('sk-graenser').setData(e.skGraenser);
     MAP.getSource('kom-graenser').setData(e.komGraenser);
     MAP.getSource('kreds-graenser').setData(e.kredsGraenser);
-    MAP.getSource('kom-labels').setData({type: 'FeatureCollection', features: S.gruppe ? [] : e.komLabels});
+    const labels = !S.sk ? e.skLabels : S.gruppe ? [] : e.komLabels.filter((l) => l.sk.includes(S.sk));
+    MAP.getSource('labels').setData({type: 'FeatureCollection', features: labels});
     MAP.getSource('valgt').setData({type: 'FeatureCollection', features: valgtFeatures()});
     legende(skala);
     if (zoom) {
@@ -394,10 +470,14 @@ function tegn(zoom = false) {
 function valgtFeatures() {
   const e = E[S.valg];
   if (S.omr) return e.features.filter((f) => f.id === S.omr);
-  if (!S.gruppe) return [];
-  if (S.gruppe.type === 'kommune') return e.komFeatures.filter((f) => f.properties.navn === S.gruppe.navn);
-  return e.features.filter((f) => e.omr.get(f.id).kreds === S.gruppe.navn);
+  if (S.gruppe) {
+    if (S.gruppe.type === 'kommune') return [omrids(e.featureAf.get('k:' + S.gruppe.navn))];
+    return e.features.filter((f) => e.omr.get(f.id).kreds === S.gruppe.navn);
+  }
+  if (S.sk) return [omrids(e.featureAf.get('s:' + S.sk))];
+  return [];
 }
+const omrids = (f) => f.omrids ? {type: 'Feature', properties: {}, geometry: f.omrids} : f;
 
 // ---------- tegnforklaring ----------
 function legende(skala) {
@@ -410,17 +490,15 @@ function legende(skala) {
     el.innerHTML = steps(BLAA, ['', ...ANDEL_GRAENSER.map((g) => g + ' %')], `LA's andel af gyldige stemmer, ${aar}`);
   } else if (S.farve === 'aendring') {
     const fk = FORRIGE[S.valg];
-    el.innerHTML = fk
-      ? steps(DIV, ['', ...DIV_GRAENSER.map((g) => (g > 0 ? '+' : '') + nf1.format(g))], `Ændring i LA-andel ${AAR[fk]} → ${aar} (pct.-point)`,
-        'To sammenlagte områder sammenlignes med summen af deres forgængere')
-      : `<div class="lg-title">Ingen sammenligning</div><div class="lg-note">Der er ikke hentet data for valget før ${aar}.</div>`;
+    el.innerHTML = steps(DIV, ['', ...DIV_GRAENSER.map((g) => (g > 0 ? '+' : '') + nf1.format(g))], `Ændring i LA-andel ${AAR[fk]} → ${aar} (pct.-point)`,
+      'Sammenlagte områder sammenlignes med summen af deres forgængere');
   } else if (S.farve === 'top') {
-    const e = E[S.valg];
-    const brugt = new Set([...e.omr.values()].map((o) => topKandidat(o).navn));
-    const cats = [...KAND_FARVE[S.valg].entries()].filter(([k]) => brugt.has(k)).map(([k, c]) => `<span><i class="swatch" style="background:${c}"></i>${esc(k)}</span>`);
-    if ([...brugt].some((k) => k && !KAND_FARVE[S.valg].has(k))) cats.push(`<span><i class="swatch" style="background:${ANDRE}"></i>Andre</span>`);
+    const brugt = new Set([...E[S.valg].omr.values()].filter((o) => o.storkreds === S.sk).map((o) => topKandidat(o).navn));
+    const farver = KAND_FARVE[S.valg]?.[S.sk] || new Map();
+    const cats = [...farver.entries()].filter(([k]) => brugt.has(k)).map(([k, c]) => `<span><i class="swatch" style="background:${c}"></i>${esc(k)}</span>`);
+    if ([...brugt].some((k) => k && !farver.has(k))) cats.push(`<span><i class="swatch" style="background:${ANDRE}"></i>Andre</span>`);
     if (brugt.has(null)) cats.push(`<span><i class="swatch" style="background:${UAFGJORT}"></i>Delt førsteplads</span>`);
-    el.innerHTML = `<div class="lg-title">LA-kandidaten med flest personlige stemmer, ${aar}</div><div class="lg-cats">${cats.join('')}</div>`;
+    el.innerHTML = `<div class="lg-title">LA-kandidaten med flest personlige stemmer, ${esc(kortSk(S.sk))} ${aar}</div><div class="lg-cats">${cats.join('')}</div>`;
   } else {
     el.innerHTML = steps(BLAA, ['', ...skala.graenser.map((g) => nf.format(g) + ' %')],
       `${esc(S.kandidat)}: personlige stemmer i pct. af LA's stemmer, ${aar}`);
@@ -429,23 +507,26 @@ function legende(skala) {
 
 // ---------- værktøjslinje ----------
 function knapper() {
-  const chip = (aktiv, tekst, data, disabled = false) =>
-    `<button type="button" class="chip" aria-pressed="${aktiv}" ${data} ${disabled ? 'disabled' : ''}>${tekst}</button>`;
+  const chip = (aktiv, tekst, data, disabled = false, title = '') =>
+    `<button type="button" class="chip" aria-pressed="${aktiv}" ${data} ${disabled ? 'disabled' : ''} ${title ? `title="${esc(title)}"` : ''}>${tekst}</button>`;
   $('valg-knapper').innerHTML = Object.keys(D.valg).map((k) => chip(S.valg === k, 'FV' + AAR[k].slice(2) + ' · ' + AAR[k], `data-valg="${k}"`)).join('');
-  $('farve-knapper').innerHTML = FARVNINGER.map((f) => chip(S.farve === f.id, f.navn, `data-farve="${f.id}"`, f.id === 'aendring' && !FORRIGE[S.valg])).join('');
-  $('niveau-knapper').innerHTML = NIVEAUER.map((n) => chip(S.niveau === n.id, n.navn, `data-niveau="${n.id}"`)).join('');
+  $('farve-knapper').innerHTML = FARVNINGER.map((f) => chip(S.farve === f.id, f.navn, `data-farve="${f.id}"`,
+    (f.id === 'aendring' && !FORRIGE[S.valg]) || (f.kraeverSk && !S.sk), f.kraeverSk && !S.sk ? 'Vælg først en storkreds – kandidaterne er forskellige i hver storkreds' : '')).join('');
+  $('niveau-knapper').innerHTML = NIVEAUER.map((n) => chip(S.niveau === n.id, n.navn, `data-niveau="${n.id}"`, n.id === 'storkreds' && !!S.sk)).join('');
+  const skSel = $('sk-valg');
+  skSel.innerHTML = `<option value="">Hele landet</option>` + [...E[S.valg].grupper.storkreds.keys()].sort((a, b) => a.localeCompare(b, 'da'))
+    .map((n) => `<option value="${esc(n)}" ${n === S.sk ? 'selected' : ''}>${esc(kortSk(n))}</option>`).join('');
   const sel = $('kandidat-valg');
   sel.hidden = S.farve !== 'kandidat';
-  sel.innerHTML = E[S.valg].v.la_kandidater.map((k) => `<option value="${esc(k.navn)}" ${k.navn === S.kandidat ? 'selected' : ''}>${esc(k.navn)} (${int(k.stemmer)})</option>`).join('');
+  sel.innerHTML = kandidaterISk().map((k) => `<option value="${esc(k.navn)}" ${k.navn === S.kandidat ? 'selected' : ''}>${esc(k.navn)} (${int(k.stemmer)})</option>`).join('');
 }
 
 function skiftValg(k) {
   S.valg = k;
-  if (S.farve === 'aendring' && !FORRIGE[k]) S.farve = 'andel';
   const e = E[k];
   if (S.omr && !e.omr.has(S.omr)) S.omr = null;
-  if (S.gruppe && !e.grupper[S.gruppe.type].has(S.gruppe.navn)) S.gruppe = null;
-  sikrKandidat();
+  if (S.gruppe && !e.grupper[S.gruppe.type].has(S.gruppe.navn)) { S.gruppe = null; S.omr = null; }
+  ret();
   tegn(false);
 }
 
@@ -453,14 +534,15 @@ function skiftValg(k) {
 function visTooltip(ev, u) {
   if (!u) return;
   const t = $('tooltip');
-  const navn = u.type ? u.navn + ' Kommune' : u.navn;
-  const under = u.type ? `${u.n} afstemningsområder · ${u.kredse.join(', ')}` : `${u.kommune} Kommune · ${u.kreds}`;
+  const navn = u.type === 'kommune' ? u.navn + ' Kommune' : u.navn;
+  const under = u.type === 'storkreds' ? `${u.n} afstemningsområder · ${u.kommuner.length} kommuner`
+    : u.type ? `${u.n} afstemningsområder · ${kortSk(u.storkredse[0])}` : `${u.kommune} Kommune · ${u.kreds} · ${kortSk(u.storkreds)}`;
   const top = topKandidat(u);
   const d = aendring(u);
   let rows = `<div class="tt-row"><span>LA</span><span>${int(u.la)} · <b style="display:inline">${pct(andel(u))}</b></span></div>`;
   if (FORRIGE[S.valg]) rows += `<div class="tt-row"><span>Siden ${AAR[FORRIGE[S.valg]]}</span><span>${d == null ? 'ikke sammenlignelig' : ppKort(d) + ' pct.-p.'}</span></div>`;
-  rows += `<div class="tt-row"><span>Flest pers. stemmer</span><span>${top.navn ? esc(top.navn) + ' (' + int(top.stemmer) + ')' : top.delt ? 'delt: ' + esc(top.delt.join(', ')) + ' (' + int(top.stemmer) + ')' : '–'}</span></div>`;
-  if (S.farve === 'kandidat') rows += `<div class="tt-row"><span>${esc(S.kandidat)}</span><span>${int(u.la_kandidater[S.kandidat] || 0)} · ${pct(kandAndel(u, S.kandidat))} af LA</span></div>`;
+  if (u.type !== 'storkreds' || true) rows += `<div class="tt-row"><span>Flest pers. stemmer</span><span>${top.navn ? esc(top.navn) + ' (' + int(top.stemmer) + ')' : top.delt ? 'delt: ' + esc(top.delt.slice(0, 3).join(', ')) + ' (' + int(top.stemmer) + ')' : '–'}</span></div>`;
+  if (S.farve === 'kandidat' && iSk(u)) rows += `<div class="tt-row"><span>${esc(S.kandidat)}</span><span>${int(u.la_kandidater[S.kandidat] || 0)} · ${pct(kandAndel(u, S.kandidat))} af LA</span></div>`;
   t.innerHTML = `<b>${esc(navn)}</b><div class="muted">${esc(under)}</div>${rows}`;
   t.hidden = false;
   const x = Math.min(ev.clientX + 14, innerWidth - t.offsetWidth - 8);
@@ -472,20 +554,19 @@ function skjulTooltip() { $('tooltip').hidden = true; }
 // ---------- sidepanel ----------
 function sidepanel() {
   const e = E[S.valg];
-  // brødkrummer
-  const c = [`<button type="button" data-nav="top">Storkredsen</button>`];
-  if (S.gruppe) {
-    const label = S.gruppe.type === 'kommune' ? S.gruppe.navn + ' Kommune' : S.gruppe.navn + ' (opstillingskreds)';
-    c.push(S.omr ? `<button type="button" data-nav="gruppe">${esc(label)}</button>` : `<span class="cur">${esc(label)}</span>`);
-  }
-  if (S.omr) c.push(`<span class="cur">${esc(e.omr.get(S.omr).navn)}</span>`);
-  if (!S.gruppe) c[0] = `<span class="cur">Storkredsen</span>`;
+  const c = [];
+  const led = (tekst, nav, aktiv) => aktiv ? `<span class="cur">${esc(tekst)}</span>` : `<button type="button" data-nav="${nav}">${esc(tekst)}</button>`;
+  c.push(led('Danmark', 'top', !S.sk));
+  if (S.sk) c.push(led(S.sk, 'sk', !S.gruppe));
+  if (S.gruppe) c.push(led(S.gruppe.type === 'kommune' ? S.gruppe.navn + ' Kommune' : S.gruppe.navn + ' (opstillingskreds)', 'gruppe', !S.omr));
+  if (S.omr) c.push(led(e.omr.get(S.omr).navn, '', true));
   $('crumbs').innerHTML = c.join('<span class="sep">›</span>');
 
   let html;
   if (S.omr) html = visOmraade(e.omr.get(S.omr));
   else if (S.gruppe) html = visGruppe(e.grupper[S.gruppe.type].get(S.gruppe.navn));
-  else html = visOversigt();
+  else if (S.sk) html = visStorkreds(e.grupper.storkreds.get(S.sk));
+  else html = visDanmark();
   $('side-body').innerHTML = html;
 }
 
@@ -495,7 +576,7 @@ function tiles(u, ekstra = '') {
   const delta = f
     ? `<div class="delta"><span class="${andel(u) - andel(f) >= 0 ? 'up' : 'down'}">${pp(andel(u) - andel(f))}</span> · ${fortegn(u.la - f.la)} stemmer siden ${AAR[fk]}</div>`
     : fk ? `<div class="delta">Området fandtes ikke i samme form i ${AAR[fk]}</div>` : '';
-  const sammen = u.id && f && forrigeNavne(u) ? `<div class="delta">Sammenlignet med ${AAR[fk]}-områderne ${esc(forrigeNavne(u).join(' + '))}</div>` : '';
+  const sammen = u.id && !u.type && f && forrigeNavne(u) ? `<div class="delta">Sammenlignet med ${AAR[fk]}-områderne ${esc(forrigeNavne(u).join(' + '))}</div>` : '';
   return `<div class="tiles">
     <div class="tile wide"><div class="label">LA's stemmer · FV${AAR[S.valg].slice(2)}</div>
       <div class="value hero">${pct(andel(u))}</div>
@@ -510,8 +591,8 @@ function tiles(u, ekstra = '') {
   </div>`;
 }
 
-function kandidatBars(u, {klik = true, meta = true} = {}) {
-  const info = new Map(E[S.valg].v.la_kandidater.map((k) => [k.navn, k]));
+function kandidatBars(u, sk, {klik = true, meta = true} = {}) {
+  const info = new Map((E[S.valg].v.la_kandidater[sk] || []).map((k) => [k.navn, k]));
   const r = Object.entries(u.la_kandidater).sort((a, b) => b[1] - a[1]);
   const max = Math.max(1, ...r.map((x) => x[1]));
   const rows = r.map(([navn, n]) => {
@@ -540,7 +621,7 @@ function alleTop(u, n = 5) {
   }).join('')}</ul>`;
 }
 
-function rangliste(enheder, idAf, {sub = () => '', sortering = true} = {}) {
+function rangliste(enheder, {sub = () => '', sortering = true, max = Infinity} = {}) {
   const sorter = {
     andel: (a, b) => andel(b) - andel(a),
     stemmer: (a, b) => b.la - a.la,
@@ -549,17 +630,18 @@ function rangliste(enheder, idAf, {sub = () => '', sortering = true} = {}) {
   };
   const s = sorter[S.sort] || sorter.andel;
   const skala = S.farve === 'kandidat' ? kandSkala() : null;
-  const li = [...enheder].sort(s).map((u) => `<li tabindex="0" data-id="${esc(idAf(u))}">
-    <span class="dot" style="background:${farveAf(u, skala)}"></span><span class="name">${esc(u.navn)}</span>
-    <span class="val">${S.farve === 'andel' ? pct(andel(u)) : maalText2(u)}</span>
+  const alle = [...enheder].sort(s);
+  const li = alle.slice(0, max).map((u) => `<li tabindex="0" data-id="${esc(u.id)}">
+    <span class="dot" style="background:${farveAf(u, skala)}"></span><span class="name">${esc(u.type === 'storkreds' ? kortSk(u.navn) : u.navn)}</span>
+    <span class="val">${S.farve === 'andel' ? pct(andel(u)) : pct(andel(u)) + ' · ' + maalTekst(u)}</span>
     <span class="sub">${sub(u)}</span></li>`).join('');
   const valg = sortering ? `<label class="sort">Sortér efter <select data-sort>
       ${[['andel', 'LA-andel'], ['stemmer', 'LA-stemmer'], ...(S.farve !== 'andel' ? [['maal', FARVNINGER.find((f) => f.id === S.farve).navn]] : []), ['navn', 'Navn']]
         .map(([k, t]) => `<option value="${k}" ${S.sort === k ? 'selected' : ''}>${t}</option>`).join('')}
     </select></label>` : '';
-  return valg + `<ul class="rank">${li}</ul>`;
+  const mere = alle.length > max ? `<p class="note">Viser ${max} af ${alle.length}.</p>` : '';
+  return valg + `<ul class="rank">${li}</ul>` + mere;
 }
-const maalText2 = (u) => `${pct(andel(u))} · ${maalTekst(u)}`;
 
 function topSub(u) {
   const t = topKandidat(u);
@@ -567,65 +649,92 @@ function topSub(u) {
 }
 
 function kandidatSektion(enheder, overskrift) {
-  if (S.farve !== 'kandidat') return '';
+  if (S.farve !== 'kandidat' || !S.kandidat) return '';
   const k = S.kandidat;
+  const skala = kandSkala();
   const r = [...enheder].sort((a, b) => (b.la_kandidater[k] || 0) - (a.la_kandidater[k] || 0)).slice(0, 10);
   return `<h2>${overskrift.replace('%k', esc(k))}</h2>
-    <ul class="rank">${r.map((o) => `<li tabindex="0" data-id="${esc(o.id)}"><span class="dot" style="background:${farveAf(o, kandSkala())}"></span>
+    <ul class="rank">${r.map((o) => `<li tabindex="0" data-id="${esc(o.id)}"><span class="dot" style="background:${farveAf(o, skala)}"></span>
       <span class="name">${esc(o.navn)}</span><span class="val">${int(o.la_kandidater[k] || 0)}</span>
       <span class="sub">${esc(o.kommune)} · ${pct(kandAndel(o, k))} af LA's stemmer</span></li>`).join('')}</ul>`;
 }
 
-function visOversigt() {
+function visDanmark() {
   const e = E[S.valg];
-  const valgte = e.v.la_kandidater.filter((k) => k.valgt);
+  const valgte = Object.entries(e.v.la_kandidater).flatMap(([sk, l]) => l.filter((k) => k.valgt).map((k) => ({...k, sk})))
+    .sort((a, b) => b.stemmer - a.stemmer);
+  const ekstra = `<div class="tile wide"><div class="label">Valgte LA-kandidater</div>
+    <div class="value">${valgte.length}</div><div class="delta">Kilde: Danmarks Statistik, kandstat</div></div>`;
+  const valgteListe = `<ul class="bars">${valgte.map((k) => `<li class="klik" tabindex="0" data-sk-kandidat="${esc(k.sk)}|${esc(k.navn)}">
+      <div class="row"><span class="name"><span class="txt">${esc(k.navn)}</span></span><span class="val">${int(k.stemmer)}</span></div>
+      <div class="meta">${esc(kortSk(k.sk))}${k.valgt.includes('T') ? ' · tillægsmandat' : k.valgt.includes('K') ? ' · kredsmandat' : ''}</div></li>`).join('')}</ul>
+    <p class="note">Personlige stemmer i storkredsen. Klik for at se kandidatens stemmer på kortet.</p>`;
+  return `<p class="sub-head">${esc(e.v.navn)} · ${e.omr.size} afstemningsområder · ${e.grupper.kommune.size} kommuner · ${e.grupper.storkreds.size} storkredse</p>
+    ${tiles(e.total, ekstra)}
+    <h2>Storkredse</h2>
+    ${rangliste(e.grupper.storkreds.values(), {sub: (u) => `${int(u.la)} stemmer · ${u.kommuner.length} ${u.kommuner.length === 1 ? 'kommune' : 'kommuner'}`})}
+    <h2>Valgte LA-kandidater</h2>
+    ${valgteListe}
+    <h2>Kommuner</h2>
+    ${rangliste(e.grupper.kommune.values(), {sub: (u) => `${int(u.la)} stemmer · ${esc(kortSk(u.storkredse[0]))}`, sortering: false, max: 25})}`;
+}
+
+function visStorkreds(g) {
+  const e = E[S.valg];
+  const alle = [...e.grupper.storkreds.values()].sort((a, b) => andel(b) - andel(a));
+  const valgte = (e.v.la_kandidater[g.navn] || []).filter((k) => k.valgt);
   const ekstra = `<div class="tile wide"><div class="label">Valgt for LA i storkredsen</div>
     <div class="value" style="font-size:17px">${valgte.length ? valgte.map((k) => esc(k.navn)).join(', ') : 'Ingen'}</div>
-    <div class="delta">Kilde: Danmarks Statistik, kandstat</div></div>`;
-  return `<p class="sub-head">${esc(e.v.navn)} · ${e.omr.size} afstemningsområder · ${e.grupper.kommune.size} kommuner · 6 opstillingskredse</p>
-    ${tiles(e.total, ekstra)}
+    <div class="delta">${alle.indexOf(g) + 1}. højeste LA-andel af ${alle.length} storkredse · landet: ${pct(andel(e.total))}</div></div>`;
+  const kredse = [...e.grupper.kreds.values()].filter((k) => k.storkredse.includes(g.navn));
+  const kommuner = [...e.grupper.kommune.values()].filter((k) => k.storkredse.includes(g.navn));
+  return `<h2 class="navn">${esc(g.navn)}</h2>
+    <p class="sub-head">${g.n} afstemningsområder · ${kommuner.length} kommuner · ${kredse.length} opstillingskredse</p>
+    ${tiles(g, ekstra)}
     <h2>LA-kandidaternes personlige stemmer</h2>
-    ${kandidatBars(e.total)}
-    ${kandidatSektion(e.omr.values(), 'Hvor fik %k flest stemmer?')}
+    ${kandidatBars(g, g.navn)}
+    ${kandidatSektion(g.omraader, 'Hvor fik %k flest stemmer?')}
     <h2>Kommuner</h2>
-    ${rangliste(e.grupper.kommune.values(), (u) => 'k:' + u.navn, {sub: topSub})}
+    ${rangliste(kommuner, {sub: topSub})}
     <h2>Opstillingskredse</h2>
-    ${rangliste(e.grupper.kreds.values(), (u) => 'kreds:' + u.navn, {sub: (u) => esc(u.kommuner.join(', ')), sortering: false})}`;
+    ${rangliste(kredse, {sub: (u) => esc(u.kommuner.join(', ')), sortering: false})}`;
 }
 
 function visGruppe(g) {
   const e = E[S.valg];
-  const alle = [...e.grupper[g.type].values()].sort((a, b) => andel(b) - andel(a));
+  const alle = [...e.grupper[g.type].values()].filter((x) => x.storkredse.includes(S.sk)).sort((a, b) => andel(b) - andel(a));
   const rang = alle.indexOf(g) + 1;
   const titel = g.type === 'kommune' ? g.navn + ' Kommune' : g.navn;
   const under = g.type === 'kommune' ? `Opstillingskreds: ${g.kredse.join(', ')}` : `Opstillingskreds med ${g.kommuner.join(' og ')} Kommune`;
-  const ekstra = `<div class="tile wide"><div class="label">Placering blandt ${alle.length} ${g.type === 'kommune' ? 'kommuner' : 'opstillingskredse'} (LA-andel)</div>
-    <div class="value">${rang}. plads</div><div class="delta">Storkredsen samlet: ${pct(andel(e.total))}</div></div>`;
+  const skg = e.grupper.storkreds.get(S.sk);
+  const ekstra = `<div class="tile wide"><div class="label">Placering blandt ${alle.length} ${g.type === 'kommune' ? 'kommuner' : 'opstillingskredse'} i storkredsen (LA-andel)</div>
+    <div class="value">${rang}. plads</div><div class="delta">${esc(kortSk(S.sk))}: ${pct(andel(skg))} · landet: ${pct(andel(e.total))}</div></div>`;
   return `<h2 class="navn">${esc(titel)}</h2><p class="sub-head">${esc(under)} · ${g.n} afstemningsområder</p>
     ${tiles(g, ekstra)}
     <h2>LA-kandidater – personlige stemmer</h2>
-    ${kandidatBars(g)}
+    ${kandidatBars(g, S.sk)}
     <h2>Flest personlige stemmer – alle partier</h2>
     ${alleTop(g)}
     ${kandidatSektion(g.omraader, 'Hvor i ' + esc(g.navn) + ' fik %k flest stemmer?')}
     <h2>Afstemningsområder</h2>
-    ${rangliste(g.omraader, (o) => o.id, {sub: topSub})}`;
+    ${rangliste(g.omraader, {sub: topSub})}`;
 }
 
 function visOmraade(o) {
   const e = E[S.valg];
   const kom = e.grupper.kommune.get(o.kommune);
+  const skg = e.grupper.storkreds.get(o.storkreds);
   const iKom = [...kom.omraader].sort((a, b) => andel(b) - andel(a)).indexOf(o) + 1;
-  const iSk = [...e.omr.values()].sort((a, b) => andel(b) - andel(a)).indexOf(o) + 1;
+  const iSkR = [...skg.omraader].sort((a, b) => andel(b) - andel(a)).indexOf(o) + 1;
   const ekstra = `<div class="tile wide"><div class="label">Placering (LA-andel)</div>
-    <div class="value" style="font-size:17px">${iKom}. af ${kom.n} i kommunen · ${iSk}. af ${e.omr.size} i storkredsen</div>
-    <div class="delta">${esc(o.kommune)}: ${pct(andel(kom))} · storkredsen: ${pct(andel(e.total))}</div></div>`;
+    <div class="value" style="font-size:17px">${iKom}. af ${kom.n} i kommunen · ${iSkR}. af ${skg.n} i storkredsen</div>
+    <div class="delta">${esc(o.kommune)}: ${pct(andel(kom))} · ${esc(kortSk(o.storkreds))}: ${pct(andel(skg))}</div></div>`;
   return `<h2 class="navn">${esc(o.navn)}</h2>
     <p class="sub-head">${esc(o.kommune)} Kommune · ${esc(o.kreds)}</p>
     <dl class="stamdata"><dt>Stemmested</dt><dd>${esc(o.stemmested || '–')}</dd><dt>Adresse</dt><dd>${esc(o.adresse || '–')}</dd></dl>
     ${tiles(o, ekstra)}
     <h2>LA-kandidater – personlige stemmer</h2>
-    ${kandidatBars(o, {meta: false})}
+    ${kandidatBars(o, o.storkreds, {meta: false})}
     <h2>Flest personlige stemmer – alle partier</h2>
     ${alleTop(o)}`;
 }
@@ -633,40 +742,46 @@ function visOmraade(o) {
 // ---------- hændelser ----------
 function haendelser() {
   document.addEventListener('click', (ev) => {
-    const b = ev.target.closest('[data-valg],[data-farve],[data-niveau],[data-nav],[data-kandidat],ul.rank li[data-id]');
+    const b = ev.target.closest('[data-valg],[data-farve],[data-niveau],[data-nav],[data-kandidat],[data-sk-kandidat],ul.rank li[data-id]');
     if (!b || b.disabled) return;
     if (b.dataset.valg) return skiftValg(b.dataset.valg);
-    if (b.dataset.farve) { S.farve = b.dataset.farve; sikrKandidat(); return tegn(false); }
+    if (b.dataset.farve) { S.farve = b.dataset.farve; ret(); return tegn(false); }
     if (b.dataset.niveau) { S.niveau = b.dataset.niveau; return tegn(false); }
-    if (b.dataset.nav === 'top') return vaelg(null, null);
-    if (b.dataset.nav === 'gruppe') return vaelg(S.gruppe.type, S.gruppe.navn);
-    if (b.dataset.kandidat) { S.farve = 'kandidat'; S.kandidat = b.dataset.kandidat; return tegn(false); }
+    if (b.dataset.nav === 'top') return vaelg(null);
+    if (b.dataset.nav === 'sk') return vaelg(S.sk);
+    if (b.dataset.nav === 'gruppe') return vaelg(S.sk, S.gruppe.type, S.gruppe.navn);
+    if (b.dataset.kandidat) { S.farve = 'kandidat'; S.kandidat = b.dataset.kandidat; ret(); return tegn(false); }
+    if (b.dataset.skKandidat) {
+      const [sk, navn] = b.dataset.skKandidat.split('|');
+      S.farve = 'kandidat'; S.kandidat = navn;
+      return vaelg(sk);
+    }
     if (b.dataset.id) {
-      const id = b.dataset.id;
-      if (id.startsWith('k:')) return vaelg('kommune', id.slice(2));
-      if (id.startsWith('kreds:')) return vaelg('kreds', id.slice(6));
-      const o = E[S.valg].omr.get(id);
-      const g = S.gruppe && (S.gruppe.type === 'kommune' ? o.kommune === S.gruppe.navn : o.kreds === S.gruppe.navn) ? S.gruppe : {type: 'kommune', navn: o.kommune};
-      return vaelg(g.type, g.navn, id);
+      const u = enhedAf(b.dataset.id);
+      if (!u) return;
+      if (u.type === 'storkreds') return vaelg(u.navn);
+      if (u.type) return vaelg(S.sk && u.storkredse.includes(S.sk) ? S.sk : u.storkredse[0], u.type, u.navn);
+      const g = S.gruppe && (S.gruppe.type === 'kommune' ? u.kommune === S.gruppe.navn : u.kreds === S.gruppe.navn) ? S.gruppe : {type: 'kommune', navn: u.kommune};
+      return vaelg(u.storkreds, g.type, g.navn, u.id);
     }
   });
   document.addEventListener('keydown', (ev) => {
-    if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.matches('ul.rank li[data-id], .bars li[data-kandidat]')) { ev.preventDefault(); ev.target.click(); }
-    if (ev.key === 'Escape') {
-      if (S.omr) vaelg(S.gruppe.type, S.gruppe.navn); else if (S.gruppe) vaelg(null, null);
-    }
+    if ((ev.key === 'Enter' || ev.key === ' ') && ev.target.matches('ul.rank li[data-id], .bars li[data-kandidat], .bars li[data-sk-kandidat]')) { ev.preventDefault(); ev.target.click(); }
+    if (ev.key === 'Escape' && !ev.target.matches('select')) op();
   });
   document.addEventListener('change', (ev) => {
     if (ev.target.id === 'kandidat-valg') { S.kandidat = ev.target.value; tegn(false); }
+    if (ev.target.id === 'sk-valg') vaelg(ev.target.value || null);
     if (ev.target.matches('[data-sort]')) { S.sort = ev.target.value; sidepanel(); }
   });
-  // hover i listerne fremhæver området på kortet
+  // hover i listerne fremhæver enheden på kortet (når den er tegnet på det aktuelle niveau)
   $('side-body').addEventListener('mouseover', (ev) => {
     const li = ev.target.closest('ul.rank li[data-id]');
     if (!li || !MAP) return;
-    const id = li.dataset.id;
-    if (id.startsWith('kreds:')) return;
-    if (S.niveau === 'kommune' ? id.startsWith('k:') : !id.startsWith('k:')) setHover(id);
+    if (MAP.getSource('enheder') && enhedAf(li.dataset.id)) {
+      const u = enhedAf(li.dataset.id);
+      if ((u.type || 'omr') === S.niveau) setHover(li.dataset.id);
+    }
   });
   $('side-body').addEventListener('mouseleave', () => MAP && setHover(null));
   addEventListener('hashchange', () => { laesHash(); tegn(true); });
@@ -680,9 +795,9 @@ async function main() {
     koder.forEach((k, i) => { E[k] = forbered(k, topo[i]); });
     kandidatFarver();
     laesHash();
-    $('updated').textContent = `Liberal Alliances stemmer ved folketingsvalgene ${koder.map((k) => AAR[k]).reverse().join(' og ')}`;
+    $('updated').textContent = `Liberal Alliances stemmer ved folketingsvalgene ${koder.map((k) => AAR[k]).reverse().join(' og ')} – hele landet, ned på afstemningsområde`;
     $('method').innerHTML = `<b>Kilder.</b> Stemmetal: valg.dk (fintælling pr. afstemningsområde). Valgte og stedfortrædere samt prioriterede kredse: Danmarks Statistik, kandstat. Kort: DAGI (Klimadatastyrelsen), forenklet af ValgTal. Alle tal er summeret fra afstemningsområderne og kontrolleret mod valg.dk's kredstal og DST's kandidattal. Data bygget ${esc(D.meta.bygget)}.<br>
-      <b>Læsevejledning.</b> Ved sideordnet opstilling står alle LA's kandidater på stemmesedlen i hele storkredsen, men en kandidat, der er <i>prioriteret</i> i en kreds, står øverst dér – det giver typisk flere personlige stemmer i den kreds. Ændringer måles mod områder med samme DAGI-id ved forrige valg; nye eller sammenlagte områder står grå. Kommunetal summerer de afstemningsområder, der ligger i storkredsen.`;
+      <b>Læsevejledning.</b> Ved sideordnet opstilling står alle LA's kandidater på stemmesedlen i hele storkredsen, men en kandidat, der er <i>prioriteret</i> i en kreds, står øverst dér – det giver typisk flere personlige stemmer i den kreds. Kandidaterne er forskellige i hver storkreds, så "Største LA-kandidat" og "Én kandidat" kræver, at en storkreds er valgt. Ændringer måles mod de områder, der dækkede samme geografi ved forrige valg. Færøerne og Grønland er ikke med.`;
     haendelser();
     knapper();
     sidepanel();
